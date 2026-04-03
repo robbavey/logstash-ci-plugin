@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fetches the latest workflow run conclusion for each plugin/branch/workflow
-// combination and writes a grouped markdown status page to STATUS.md.
+// combination and writes a pre-grouped index.html — no client-side API calls.
 
 import { writeFileSync } from 'fs';
 
@@ -35,7 +35,7 @@ const PLUGINS = [
   },
 ];
 
-// ── GitHub API helpers ────────────────────────────────────────────────────────
+// ── GitHub API ────────────────────────────────────────────────────────────────
 
 const HEADERS = {
   Accept: 'application/vnd.github+json',
@@ -50,15 +50,17 @@ async function fetchConclusion(repo, workflowFile, branch) {
     `https://api.github.com/repos/${ORG}/${repo}/actions/workflows/` +
     `${encodeURIComponent(workflowFile)}/runs` +
     `?branch=${encodeURIComponent(branch)}&per_page=1&exclude_pull_requests=true`;
-
-  const res = await fetch(url, { headers: HEADERS });
-  if (!res.ok) return 'no_status';
-
-  const data = await res.json();
-  const run = data.workflow_runs?.[0];
-  if (!run) return 'no_status';
-  if (run.status !== 'completed') return 'pending';
-  return run.conclusion ?? 'no_status';
+  try {
+    const res = await fetch(url, { headers: HEADERS });
+    if (!res.ok) return 'no_status';
+    const data = await res.json();
+    const run = data.workflow_runs?.[0];
+    if (!run) return 'no_status';
+    if (run.status !== 'completed') return 'pending';
+    return run.conclusion ?? 'no_status';
+  } catch {
+    return 'no_status';
+  }
 }
 
 function rowStatus(conclusions) {
@@ -68,51 +70,251 @@ function rowStatus(conclusions) {
   return 'no_status';
 }
 
-// ── Markdown rendering ────────────────────────────────────────────────────────
+// ── HTML rendering ────────────────────────────────────────────────────────────
 
-function badgeMd(repo, branch, workflow) {
-  const base = `https://github.com/${ORG}/${repo}/actions/workflows/${workflow.file}`;
-  const img  = `${base}/badge.svg?branch=${encodeURIComponent(branch)}`;
-  const href = `${base}?query=branch%3A${encodeURIComponent(branch)}`;
-  return `[![${workflow.label}](${img})](${href})`;
+const BRANCH_SVG = `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 3.25a2.25 2.25 0 113 2.122V6A2.5 2.5 0 0110 8.5H6a1 1 0 00-1 1v1.128a2.251 2.251 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.493 2.493 0 016 7h4a1 1 0 001-1v-.628A2.25 2.25 0 019.5 3.25z"/></svg>`;
+
+const TAG_CLASS = { output: 'tag-output', filter: 'tag-filter', integration: 'tag-integration' };
+
+function badgesHTML(repo, branch, workflows) {
+  return workflows.map(w => {
+    const base = `https://github.com/${ORG}/${repo}/actions/workflows/${w.file}`;
+    const href = `${base}?query=branch%3A${encodeURIComponent(branch)}`;
+    const img  = `${base}/badge.svg?branch=${encodeURIComponent(branch)}`;
+    return `<div class="badge-item">
+        <span class="badge-label">${w.label}</span>
+        <a href="${href}" target="_blank" rel="noopener"><img src="${img}" alt="${w.label}"></a>
+      </div>`;
+  }).join('\n      ');
 }
 
-function renderGroup(title, emoji, rows) {
-  const lines = [`## ${emoji} ${title} (${rows.length})\n`];
-
-  if (rows.length === 0) {
-    lines.push('_None_\n');
-    return lines.join('\n');
-  }
-
-  for (const { plugin, branch } of rows) {
-    const repoUrl = `https://github.com/${ORG}/${plugin.repo}`;
-    const badges  = plugin.workflows.map(w => badgeMd(plugin.repo, branch, w)).join(' ');
-    lines.push(`**[${plugin.repo}](${repoUrl})** — \`${branch}\``);
-    lines.push(badges);
-    lines.push('');
-  }
-
-  return lines.join('\n');
+function rowHTML(plugin, branch) {
+  return `<tr>
+      <td>
+        <div class="plugin-cell">
+          <span class="plugin-type-tag ${TAG_CLASS[plugin.type]}">${plugin.type}</span>
+          <span class="plugin-name"><a href="https://github.com/${ORG}/${plugin.repo}" target="_blank" rel="noopener">${plugin.repo}</a></span>
+        </div>
+      </td>
+      <td><span class="branch-tag">${BRANCH_SVG}${branch}</span></td>
+      <td><div class="badges">
+        ${badgesHTML(plugin.repo, branch, plugin.workflows)}
+      </div></td>
+    </tr>`;
 }
 
-function renderMarkdown(passing, failing, noStatus) {
-  const ts = new Date().toUTCString();
-  return [
-    '# logstash-plugins CI Status',
-    '',
-    `> Last updated: ${ts}`,
-    '',
-    '---',
-    '',
-    renderGroup('Passing',   '✅', passing),
-    '---',
-    '',
-    renderGroup('Failing',   '❌', failing),
-    '---',
-    '',
-    renderGroup('No Status', '⚪', noStatus),
-  ].join('\n');
+function groupHTML(id, label, dotClass, rows) {
+  const bodyRows = rows.length
+    ? rows.map(({ plugin, branch }) => rowHTML(plugin, branch)).join('\n    ')
+    : `<tr class="empty-row"><td colspan="3">None</td></tr>`;
+  return `<div class="group group-${dotClass}" id="group-${id}">
+    <div class="group-header">
+      <span class="group-label"><span class="dot"></span>${label}</span>
+      <span class="count-tag">${rows.length}</span>
+    </div>
+    <table class="rows-table">
+      <thead><tr>
+        <th class="col-plugin">Plugin</th>
+        <th class="col-branch">Branch</th>
+        <th>Workflows</th>
+      </tr></thead>
+      <tbody>
+    ${bodyRows}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+function renderHTML(passing, failing, noStatus, generatedAt) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Logstash Plugin CI Status</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #21262d;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent-blue: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --radius: 8px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      padding: 32px 24px;
+      min-height: 100vh;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 32px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .header-icon { width: 32px; height: 32px; flex-shrink: 0; color: var(--muted); }
+    header h1 { font-size: 20px; font-weight: 600; }
+    header p { font-size: 13px; color: var(--muted); margin-top: 2px; }
+
+    .group { margin-bottom: 32px; }
+
+    .group-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .group-label {
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .group-label .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+    .group-passing .dot  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .group-failing .dot  { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+    .group-nostatus .dot { background: var(--muted); }
+
+    .group-passing  .group-label { color: var(--green); }
+    .group-failing  .group-label { color: var(--red); }
+    .group-nostatus .group-label { color: var(--muted); }
+
+    .count-tag {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 1px 7px;
+      border-radius: 10px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+
+    .rows-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .rows-table thead th {
+      padding: 7px 16px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .rows-table tbody td {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    .rows-table tbody tr:last-child td { border-bottom: none; }
+    .rows-table tbody tr:hover td { background: rgba(255,255,255,0.02); }
+
+    .plugin-cell { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+
+    .plugin-type-tag {
+      font-size: 11px;
+      padding: 2px 7px;
+      border-radius: 12px;
+      font-weight: 500;
+      border: 1px solid;
+      flex-shrink: 0;
+    }
+
+    .tag-output      { background: #0c2a0c; border-color: #3fb950; color: #3fb950; }
+    .tag-filter      { background: #2a1a0c; border-color: #d29922; color: #d29922; }
+    .tag-integration { background: #0c1a2a; border-color: #388bfd; color: #58a6ff; }
+
+    .plugin-name a { color: var(--accent-blue); text-decoration: none; font-weight: 500; }
+    .plugin-name a:hover { text-decoration: underline; }
+
+    .branch-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .branch-tag svg { width: 12px; height: 12px; color: var(--muted); flex-shrink: 0; }
+
+    .badges { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
+    .badge-item { display: flex; flex-direction: column; gap: 3px; }
+    .badge-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .badge-item a { display: block; line-height: 0; }
+    .badge-item img { height: 20px; }
+
+    .empty-row td { padding: 14px 16px; color: var(--muted); font-style: italic; font-size: 13px; }
+
+    .col-plugin { width: 300px; }
+    .col-branch { width: 120px; }
+
+    footer {
+      margin-top: 48px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <svg class="header-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+    <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
+  </svg>
+  <div>
+    <h1>logstash-plugins CI Status</h1>
+    <p>Test workflow status &mdash; actively maintained branches</p>
+  </div>
+</header>
+
+${groupHTML('passing',  'Passing',   'passing',  passing)}
+${groupHTML('failing',  'Failing',   'failing',  failing)}
+${groupHTML('nostatus', 'No Status', 'nostatus', noStatus)}
+
+<footer>
+  <span>logstash-plugins &mdash; CI Status</span>
+  <span>Generated ${generatedAt} &bull; badges reflect live run status</span>
+</footer>
+
+</body>
+</html>`;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -134,6 +336,7 @@ const passing  = statuses.filter(s => s.status === 'passing');
 const failing  = statuses.filter(s => s.status === 'failing');
 const noStatus = statuses.filter(s => s.status !== 'passing' && s.status !== 'failing');
 
-const output = process.env.OUTPUT_FILE ?? 'STATUS.md';
-writeFileSync(output, renderMarkdown(passing, failing, noStatus));
+const generatedAt = new Date().toUTCString();
+const output = process.env.OUTPUT_FILE ?? 'index.html';
+writeFileSync(output, renderHTML(passing, failing, noStatus, generatedAt));
 console.log(`Written to ${output}`);
