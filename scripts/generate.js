@@ -10,7 +10,6 @@ const PLUGINS = [
   {
     repo: 'logstash-output-elasticsearch',
     type: 'output',
-    branches: ['main', '11.x', '9.x'],
     workflows: [
       { file: 'tests.yml',                    label: 'unit tests' },
       { file: 'integration-tests.yml',         label: 'integration tests' },
@@ -20,7 +19,6 @@ const PLUGINS = [
   {
     repo: 'logstash-filter-grok',
     type: 'filter',
-    branches: ['main'],
     workflows: [
       { file: 'tests.yml', label: 'tests' },
     ],
@@ -28,7 +26,6 @@ const PLUGINS = [
   {
     repo: 'logstash-integration-kafka',
     type: 'integration',
-    branches: ['main', '11.x'],
     workflows: [
       { file: 'tests.yml', label: 'tests' },
     ],
@@ -37,6 +34,21 @@ const PLUGINS = [
 
 // ── GitHub API ────────────────────────────────────────────────────────────────
 
+// Matches main and version branches (e.g. 11.x, 5.2.x, 10.4, 11.4-maintenance).
+// Excludes feature/fix/chore branches.
+const VERSION_BRANCH = /^(main|\d+\.x|\d+\.\d+\.x|\d+\.\d+(-maintenance)?)$/;
+
+// Sort so that main comes first, then version branches newest-first.
+function sortBranches(branches) {
+  return [...branches].sort((a, b) => {
+    if (a === 'main') return -1;
+    if (b === 'main') return  1;
+    const maj = name => parseInt(name.match(/^(\d+)/)?.[1] ?? '0', 10);
+    const min = name => parseFloat(name.match(/^(\d+\.\d+)/)?.[1] ?? '0');
+    return maj(b) - maj(a) || min(b) - min(a);
+  });
+}
+
 const HEADERS = {
   Accept: 'application/vnd.github+json',
   'X-GitHub-Api-Version': '2022-11-28',
@@ -44,6 +56,96 @@ const HEADERS = {
     ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
     : {}),
 };
+
+// ── Version floor detection ───────────────────────────────────────────────────
+
+// Fetch Gemfile.template from a logstash branch (the only form that exists).
+async function fetchLogstashGemfile(branch) {
+  const url = `https://raw.githubusercontent.com/elastic/logstash/${branch}/Gemfile.template`;
+  const res = await fetch(url, { headers: HEADERS });
+  return res.ok ? res.text() : null;
+}
+
+// Parse the leading major version number for a gem out of a Gemfile.template.
+// Handles both "~> 11.22" and ">= 11.14.0" constraint styles.
+function parseFloor(gemfile, gemName) {
+  if (!gemfile) return null;
+  const re = new RegExp(`["']${gemName}["'][^\\n]*?["'][~>= ]+(\\d+)\\.`);
+  const m = gemfile.match(re);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Find the highest-numbered 9.N branch of elastic/logstash.
+async function latestLogstash9xBranch() {
+  const url = 'https://api.github.com/repos/elastic/logstash/branches?per_page=100';
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const branches = data
+    .map(b => b.name)
+    .filter(n => /^9\.\d+$/.test(n))
+    .sort((a, b) => parseInt(b.split('.')[1]) - parseInt(a.split('.')[1]));
+  return branches[0] ?? null;
+}
+
+// Returns a map of { repoName -> minimumMajorVersion }.
+// Floor = min(8.19 reference, 9.x reference) — the more inclusive of the two.
+// Plugins absent from 9.x fall back to the 8.19 floor alone.
+async function buildVersionFloors() {
+  const [gemfile8, branch9] = await Promise.all([
+    fetchLogstashGemfile('8.19'),
+    latestLogstash9xBranch(),
+  ]);
+  const gemfile9 = branch9 ? await fetchLogstashGemfile(branch9) : null;
+  console.log(`Logstash 9.x reference branch: ${branch9 ?? 'none'}`);
+
+  return Object.fromEntries(
+    PLUGINS.map(p => {
+      const f8 = parseFloor(gemfile8, p.repo);
+      const f9 = parseFloor(gemfile9, p.repo);
+      const candidates = [f8, f9].filter(f => f !== null);
+      const floor = candidates.length ? Math.min(...candidates) : 0;
+      console.log(`${p.repo} version floor: ${floor} (8.19→${f8 ?? 'n/a'}, ${branch9}→${f9 ?? 'n/a'})`);
+      return [p.repo, floor];
+    })
+  );
+}
+
+// ── Branch filtering ──────────────────────────────────────────────────────────
+
+// Returns true if the branch has had any commits in the last 3 months.
+async function hasRecentActivity(repo, branch) {
+  const since = new Date();
+  since.setMonth(since.getMonth() - 3);
+  const url =
+    `https://api.github.com/repos/${ORG}/${repo}/commits` +
+    `?sha=${encodeURIComponent(branch)}&since=${since.toISOString()}&per_page=1`;
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) return false;
+  const data = await res.json();
+  return Array.isArray(data) && data.length > 0;
+}
+
+async function fetchBranches(repo, versionFloor) {
+  const url = `https://api.github.com/repos/${ORG}/${repo}/branches?per_page=100`;
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) return ['main'];
+  const data = await res.json();
+  const candidates = data.map(b => b.name).filter(n => VERSION_BRANCH.test(n));
+
+  const kept = await Promise.all(
+    candidates.map(async name => {
+      if (name === 'main') return { name, keep: true, reason: 'main' };
+      const major = parseInt(name.match(/^(\d+)/)?.[1] ?? '0', 10);
+      if (major >= versionFloor) return { name, keep: true, reason: `>= floor ${versionFloor}` };
+      const recent = await hasRecentActivity(repo, name);
+      return { name, keep: recent, reason: recent ? 'recent activity' : 'filtered out' };
+    })
+  );
+
+  kept.forEach(({ name, reason }) => console.log(`  ${repo}@${name}: ${reason}`));
+  return sortBranches(kept.filter(b => b.keep).map(b => b.name));
+}
 
 async function fetchConclusion(repo, workflowFile, branch) {
   const url =
@@ -319,7 +421,18 @@ ${groupHTML('nostatus', 'No Status', 'nostatus', noStatus)}
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-const pairs = PLUGINS.flatMap(p => p.branches.map(b => ({ plugin: p, branch: b })));
+const versionFloors = await buildVersionFloors();
+
+// Resolve branches for all plugins in parallel, then flatten into pairs.
+const pluginsWithBranches = await Promise.all(
+  PLUGINS.map(async p => {
+    const branches = await fetchBranches(p.repo, versionFloors[p.repo] ?? 0);
+    console.log(`${p.repo} branches: ${branches.join(', ')}`);
+    return { ...p, branches };
+  })
+);
+
+const pairs = pluginsWithBranches.flatMap(p => p.branches.map(b => ({ plugin: p, branch: b })));
 
 const statuses = await Promise.all(
   pairs.map(async ({ plugin, branch }) => {
