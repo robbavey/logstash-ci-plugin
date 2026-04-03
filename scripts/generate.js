@@ -66,13 +66,21 @@ async function fetchLogstashGemfile(branch) {
   return res.ok ? res.text() : null;
 }
 
-// Parse the leading major version number for a gem out of a Gemfile.template.
+// Parse { major, minor } floor from a Gemfile.template for a given gem.
 // Handles both "~> 11.22" and ">= 11.14.0" constraint styles.
 function parseFloor(gemfile, gemName) {
   if (!gemfile) return null;
-  const re = new RegExp(`["']${gemName}["'][^\\n]*?["'][~>= ]+(\\d+)\\.`);
+  const re = new RegExp(`["']${gemName}["'][^\\n]*?["'][~>= ]+(\\d+)\\.(\\d+)`);
   const m = gemfile.match(re);
-  return m ? parseInt(m[1], 10) : null;
+  return m ? { major: parseInt(m[1], 10), minor: parseInt(m[2], 10) } : null;
+}
+
+// Return the more inclusive (lower) of two { major, minor } floors.
+function minFloor(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.major !== b.major) return a.major < b.major ? a : b;
+  return a.minor <= b.minor ? a : b;
 }
 
 // Find the highest-numbered 9.N branch of elastic/logstash.
@@ -88,10 +96,11 @@ async function latestLogstash9xBranch() {
   return branches[0] ?? null;
 }
 
-// Returns a map of { repoName -> minimumMajorVersion }.
-// Floor = min(8.19 reference, 9.x reference) — the more inclusive of the two.
-// Plugins absent from 9.x fall back to the 8.19 floor alone.
-async function buildVersionFloors() {
+// Builds Logstash context used for both branch filtering and the "ships with" column.
+// Returns:
+//   logstashRefs  — [{ label, gemfile }, ...] sorted newest-first
+//   versionFloors — { repo -> { major, minor } }
+async function buildLogstashContext() {
   const [gemfile8, branch9] = await Promise.all([
     fetchLogstashGemfile('8.19'),
     latestLogstash9xBranch(),
@@ -99,19 +108,43 @@ async function buildVersionFloors() {
   const gemfile9 = branch9 ? await fetchLogstashGemfile(branch9) : null;
   console.log(`Logstash 9.x reference branch: ${branch9 ?? 'none'}`);
 
-  return Object.fromEntries(
+  // Newest-first so getLatestLogstash() can short-circuit on first match.
+  const logstashRefs = [
+    ...(branch9 && gemfile9 ? [{ label: branch9, gemfile: gemfile9 }] : []),
+    ...(gemfile8             ? [{ label: '8.19',  gemfile: gemfile8  }] : []),
+  ];
+
+  const versionFloors = Object.fromEntries(
     PLUGINS.map(p => {
       const f8 = parseFloor(gemfile8, p.repo);
       const f9 = parseFloor(gemfile9, p.repo);
-      const candidates = [f8, f9].filter(f => f !== null);
-      const floor = candidates.length ? Math.min(...candidates) : 0;
-      console.log(`${p.repo} version floor: ${floor} (8.19→${f8 ?? 'n/a'}, ${branch9}→${f9 ?? 'n/a'})`);
+      const floor = minFloor(f8, f9) ?? { major: 0, minor: 0 };
+      console.log(`${p.repo} floor: ${floor.major}.${floor.minor} (8.19→${f8 ? `${f8.major}.${f8.minor}` : 'n/a'}, ${branch9}→${f9 ? `${f9.major}.${f9.minor}` : 'n/a'})`);
       return [p.repo, floor];
     })
   );
+
+  return { logstashRefs, versionFloors };
 }
 
 // ── Branch filtering ──────────────────────────────────────────────────────────
+
+// True if a version branch name meets or exceeds { major, minor } floor.
+// "X.x" branches imply the latest minor in that series → always pass for correct major.
+// "X.Y" and "X.Y-maintenance" are compared precisely.
+function branchMeetsFloor(name, floor) {
+  if (name === 'main') return true;
+  const majorMatch = name.match(/^(\d+)/);
+  if (!majorMatch) return false;
+  const major = parseInt(majorMatch[1], 10);
+  if (major > floor.major) return true;
+  if (major < floor.major) return false;
+  // Same major: X.x implies latest, X.Y is exact.
+  if (/^\d+\.x/.test(name)) return true;
+  const minorMatch = name.match(/^\d+\.(\d+)/);
+  const minor = minorMatch ? parseInt(minorMatch[1], 10) : 0;
+  return minor >= floor.minor;
+}
 
 // Returns true if the branch has had any commits in the last 3 months.
 async function hasRecentActivity(repo, branch) {
@@ -126,7 +159,7 @@ async function hasRecentActivity(repo, branch) {
   return Array.isArray(data) && data.length > 0;
 }
 
-async function fetchBranches(repo, versionFloor) {
+async function fetchBranches(repo, floor) {
   const url = `https://api.github.com/repos/${ORG}/${repo}/branches?per_page=100`;
   const res = await fetch(url, { headers: HEADERS });
   if (!res.ok) return ['main'];
@@ -135,9 +168,7 @@ async function fetchBranches(repo, versionFloor) {
 
   const kept = await Promise.all(
     candidates.map(async name => {
-      if (name === 'main') return { name, keep: true, reason: 'main' };
-      const major = parseInt(name.match(/^(\d+)/)?.[1] ?? '0', 10);
-      if (major >= versionFloor) return { name, keep: true, reason: `>= floor ${versionFloor}` };
+      if (branchMeetsFloor(name, floor)) return { name, keep: true, reason: `>= floor ${floor.major}.${floor.minor}` };
       const recent = await hasRecentActivity(repo, name);
       return { name, keep: recent, reason: recent ? 'recent activity' : 'filtered out' };
     })
@@ -145,6 +176,28 @@ async function fetchBranches(repo, versionFloor) {
 
   kept.forEach(({ name, reason }) => console.log(`  ${repo}@${name}: ${reason}`));
   return sortBranches(kept.filter(b => b.keep).map(b => b.name));
+}
+
+// ── "Ships with" lookup ───────────────────────────────────────────────────────
+
+// Returns the label of the newest Logstash version that would install gems from
+// this plugin branch, given the sorted (newest-first) logstashRefs list.
+function getLatestLogstash(repo, branch, logstashRefs) {
+  const isXBranch   = /^\d+\.x/.test(branch);
+  const majorMatch  = branch.match(/^(\d+)/);
+  const minorMatch  = branch.match(/^\d+\.(\d+)/);
+  const branchMajor = majorMatch ? parseInt(majorMatch[1], 10) : Infinity;
+  const branchMinor = isXBranch  ? Infinity : (minorMatch ? parseInt(minorMatch[1], 10) : 0);
+
+  for (const { label, gemfile } of logstashRefs) {
+    const floor = parseFloor(gemfile, repo);
+    if (!floor) continue; // plugin not referenced in this Logstash version
+    if (branch === 'main') return label; // main tracks latest → first match wins
+    const majorOk = branchMajor > floor.major ||
+                   (branchMajor === floor.major && branchMinor >= floor.minor);
+    if (majorOk) return label;
+  }
+  return '—';
 }
 
 async function fetchConclusion(repo, workflowFile, branch) {
@@ -190,7 +243,10 @@ function badgesHTML(repo, branch, workflows) {
   }).join('\n      ');
 }
 
-function rowHTML(plugin, branch) {
+function rowHTML(plugin, branch, logstashVersion) {
+  const lsCell = logstashVersion === '—'
+    ? `<span class="ls-version ls-unknown">—</span>`
+    : `<span class="ls-version">${logstashVersion}</span>`;
   return `<tr>
       <td>
         <div class="plugin-cell">
@@ -199,16 +255,19 @@ function rowHTML(plugin, branch) {
         </div>
       </td>
       <td><span class="branch-tag">${BRANCH_SVG}${branch}</span></td>
+      <td>${lsCell}</td>
       <td><div class="badges">
         ${badgesHTML(plugin.repo, branch, plugin.workflows)}
       </div></td>
     </tr>`;
 }
 
-function groupHTML(id, label, dotClass, rows) {
+function groupHTML(id, label, dotClass, rows, logstashRefs) {
   const bodyRows = rows.length
-    ? rows.map(({ plugin, branch }) => rowHTML(plugin, branch)).join('\n    ')
-    : `<tr class="empty-row"><td colspan="3">None</td></tr>`;
+    ? rows.map(({ plugin, branch }) =>
+        rowHTML(plugin, branch, getLatestLogstash(plugin.repo, branch, logstashRefs))
+      ).join('\n    ')
+    : `<tr class="empty-row"><td colspan="4">None</td></tr>`;
   return `<div class="group group-${dotClass}" id="group-${id}">
     <div class="group-header">
       <span class="group-label"><span class="dot"></span>${label}</span>
@@ -218,6 +277,7 @@ function groupHTML(id, label, dotClass, rows) {
       <thead><tr>
         <th class="col-plugin">Plugin</th>
         <th class="col-branch">Branch</th>
+        <th class="col-logstash">Latest Logstash</th>
         <th>Workflows</th>
       </tr></thead>
       <tbody>
@@ -227,7 +287,7 @@ function groupHTML(id, label, dotClass, rows) {
   </div>`;
 }
 
-function renderHTML(passing, failing, noStatus, generatedAt) {
+function renderHTML(passing, failing, noStatus, generatedAt, logstashRefs) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -380,8 +440,20 @@ function renderHTML(passing, failing, noStatus, generatedAt) {
 
     .empty-row td { padding: 14px 16px; color: var(--muted); font-style: italic; font-size: 13px; }
 
-    .col-plugin { width: 300px; }
-    .col-branch { width: 120px; }
+    .col-plugin   { width: 300px; }
+    .col-branch   { width: 120px; }
+    .col-logstash { width: 130px; }
+
+    .ls-version {
+      font-size: 12px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .ls-version.ls-unknown { color: var(--muted); }
 
     footer {
       margin-top: 48px;
@@ -406,9 +478,9 @@ function renderHTML(passing, failing, noStatus, generatedAt) {
   </div>
 </header>
 
-${groupHTML('passing',  'Passing',   'passing',  passing)}
-${groupHTML('failing',  'Failing',   'failing',  failing)}
-${groupHTML('nostatus', 'No Status', 'nostatus', noStatus)}
+${groupHTML('passing',  'Passing',   'passing',  passing,  logstashRefs)}
+${groupHTML('failing',  'Failing',   'failing',  failing,  logstashRefs)}
+${groupHTML('nostatus', 'No Status', 'nostatus', noStatus, logstashRefs)}
 
 <footer>
   <span>logstash-plugins &mdash; CI Status</span>
@@ -421,12 +493,12 @@ ${groupHTML('nostatus', 'No Status', 'nostatus', noStatus)}
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-const versionFloors = await buildVersionFloors();
+const { logstashRefs, versionFloors } = await buildLogstashContext();
 
 // Resolve branches for all plugins in parallel, then flatten into pairs.
 const pluginsWithBranches = await Promise.all(
   PLUGINS.map(async p => {
-    const branches = await fetchBranches(p.repo, versionFloors[p.repo] ?? 0);
+    const branches = await fetchBranches(p.repo, versionFloors[p.repo] ?? { major: 0, minor: 0 });
     console.log(`${p.repo} branches: ${branches.join(', ')}`);
     return { ...p, branches };
   })
@@ -451,5 +523,5 @@ const noStatus = statuses.filter(s => s.status !== 'passing' && s.status !== 'fa
 
 const generatedAt = new Date().toUTCString();
 const output = process.env.OUTPUT_FILE ?? 'index.html';
-writeFileSync(output, renderHTML(passing, failing, noStatus, generatedAt));
+writeFileSync(output, renderHTML(passing, failing, noStatus, generatedAt, logstashRefs));
 console.log(`Written to ${output}`);
