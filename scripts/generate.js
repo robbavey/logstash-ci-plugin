@@ -290,14 +290,14 @@ async function fetchConclusion(repo, workflowFile, branch) {
     `?branch=${encodeURIComponent(branch)}&per_page=1&exclude_pull_requests=true`;
   try {
     const res = await fetch(url, { headers: HEADERS });
-    if (!res.ok) return 'no_status';
+    if (!res.ok) return { conclusion: 'no_status', runAt: null };
     const data = await res.json();
     const run = data.workflow_runs?.[0];
-    if (!run) return 'no_status';
-    if (run.status !== 'completed') return 'pending';
-    return run.conclusion ?? 'no_status';
+    if (!run) return { conclusion: 'no_status', runAt: null };
+    if (run.status !== 'completed') return { conclusion: 'pending', runAt: run.updated_at };
+    return { conclusion: run.conclusion ?? 'no_status', runAt: run.updated_at };
   } catch {
-    return 'no_status';
+    return { conclusion: 'no_status', runAt: null };
   }
 }
 
@@ -306,6 +306,11 @@ function rowStatus(conclusions) {
   if (conclusions.some(c => ['failure', 'timed_out', 'startup_failure'].includes(c))) return 'failing';
   if (conclusions.every(c => ['success', 'skipped'].includes(c))) return 'passing';
   return 'no_status';
+}
+
+function mostRecent(runAts) {
+  const valid = runAts.filter(Boolean);
+  return valid.length ? valid.sort().at(-1) : null;
 }
 
 // ── HTML rendering ────────────────────────────────────────────────────────────
@@ -326,13 +331,16 @@ function badgesHTML(repo, branch, workflows) {
   }).join('\n      ');
 }
 
-function rowHTML(plugin, branch, gemVersion, logstashVersion) {
+function rowHTML(plugin, branch, gemVersion, logstashVersion, lastRunAt) {
   const verCell = gemVersion
     ? `<span class="gem-version">${gemVersion}</span>`
     : `<span class="gem-version ls-unknown">—</span>`;
   const lsCell = logstashVersion === '—'
     ? `<span class="ls-version ls-unknown">—</span>`
     : `<span class="ls-version">${logstashVersion}</span>`;
+  const runCell = lastRunAt
+    ? `<time class="last-run" data-ts="${lastRunAt}" datetime="${lastRunAt}"></time>`
+    : `<span class="last-run ls-unknown">—</span>`;
   return `<tr>
       <td>
         <div class="plugin-cell">
@@ -343,6 +351,7 @@ function rowHTML(plugin, branch, gemVersion, logstashVersion) {
       <td><span class="branch-tag">${BRANCH_SVG}${branch}</span></td>
       <td>${verCell}</td>
       <td>${lsCell}</td>
+      <td>${runCell}</td>
       <td><div class="badges">
         ${badgesHTML(plugin.repo, branch, plugin.workflows)}
       </div></td>
@@ -351,14 +360,15 @@ function rowHTML(plugin, branch, gemVersion, logstashVersion) {
 
 function groupHTML(id, label, dotClass, rows, logstashRefs) {
   const bodyRows = rows.length
-    ? rows.map(({ plugin, branch }) =>
+    ? rows.map(({ plugin, branch, lastRunAt }) =>
         rowHTML(
           plugin, branch,
           plugin.branchVersions?.[branch] ?? null,
           getShipsWithLogstash(plugin.repo, branch, plugin.branchVersions ?? {}, logstashRefs),
+          lastRunAt,
         )
       ).join('\n    ')
-    : `<tr class="empty-row"><td colspan="5">None</td></tr>`;
+    : `<tr class="empty-row"><td colspan="6">None</td></tr>`;
   return `<div class="group group-${dotClass}" id="group-${id}">
     <div class="group-header">
       <span class="group-label"><span class="dot"></span>${label}</span>
@@ -370,6 +380,7 @@ function groupHTML(id, label, dotClass, rows, logstashRefs) {
         <th class="col-branch">Branch</th>
         <th class="col-version">Version</th>
         <th class="col-logstash">Ships with Logstash</th>
+        <th class="col-lastrun">Last Run</th>
         <th>Workflows</th>
       </tr></thead>
       <tbody>
@@ -532,10 +543,11 @@ function renderHTML(passing, failing, noStatus, generatedAt, logstashRefs) {
 
     .empty-row td { padding: 14px 16px; color: var(--muted); font-style: italic; font-size: 13px; }
 
-    .col-plugin   { width: 280px; }
-    .col-branch   { width: 110px; }
-    .col-version  { width: 100px; }
-    .col-logstash { width: 130px; }
+    .col-plugin   { width: 260px; }
+    .col-branch   { width: 100px; }
+    .col-version  { width: 95px; }
+    .col-logstash { width: 140px; }
+    .col-lastrun  { width: 90px; }
 
     .gem-version, .ls-version {
       font-size: 12px;
@@ -544,6 +556,11 @@ function renderHTML(passing, failing, noStatus, generatedAt, logstashRefs) {
       border: 1px solid var(--border);
       padding: 2px 8px;
       border-radius: 4px;
+      white-space: nowrap;
+    }
+    .last-run {
+      font-size: 12px;
+      color: var(--muted);
       white-space: nowrap;
     }
     .ls-unknown { color: var(--muted); }
@@ -580,6 +597,19 @@ ${groupHTML('nostatus', 'No Status', 'nostatus', noStatus, logstashRefs)}
   <span>Generated ${generatedAt} &bull; badges reflect live run status</span>
 </footer>
 
+<script>
+  document.querySelectorAll('time[data-ts]').forEach(el => {
+    const diff = Date.now() - new Date(el.dataset.ts);
+    const mins  = Math.floor(diff / 60000);
+    const hours = Math.floor(mins  / 60);
+    const days  = Math.floor(hours / 24);
+    el.textContent = days  > 0 ? days  + 'd ago'
+                   : hours > 0 ? hours + 'h ago'
+                   : mins  > 0 ? mins  + 'm ago'
+                   : 'just now';
+    el.title = new Date(el.dataset.ts).toUTCString();
+  });
+</script>
 </body>
 </html>`;
 }
@@ -605,12 +635,14 @@ const pairs = pluginsWithBranches.flatMap(p => p.branches.map(b => ({ plugin: p,
 
 const statuses = await Promise.all(
   pairs.map(async ({ plugin, branch }) => {
-    const conclusions = await Promise.all(
+    const results = await Promise.all(
       plugin.workflows.map(w => fetchConclusion(plugin.repo, w.file, branch))
     );
+    const conclusions = results.map(r => r.conclusion);
+    const lastRunAt  = mostRecent(results.map(r => r.runAt));
     const status = rowStatus(conclusions);
     console.log(`${plugin.repo}@${branch}: ${status} [${conclusions.join(', ')}]`);
-    return { plugin, branch, status };
+    return { plugin, branch, status, lastRunAt };
   })
 );
 
