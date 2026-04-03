@@ -178,24 +178,76 @@ async function fetchBranches(repo, floor) {
   return sortBranches(kept.filter(b => b.keep).map(b => b.name));
 }
 
+// ── Gem version fetching & semver helpers ────────────────────────────────────
+
+// Fetch the version string out of a plugin branch's gemspec.
+async function fetchGemVersion(repo, branch) {
+  const url = `https://raw.githubusercontent.com/${ORG}/${repo}/${encodeURIComponent(branch)}/${repo}.gemspec`;
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) return null;
+  const text = await res.text();
+  const m = text.match(/s\.version\s*=\s*['"]([^'"]+)['"]/);
+  return m?.[1] ?? null;
+}
+
+// Parse the full constraint (op + version parts) for a gem from a Gemfile.template.
+function parseConstraintFull(gemfile, gemName) {
+  if (!gemfile) return null;
+  const re = new RegExp(`["']${gemName}["'][^\\n]*?["']([~>= ]+)(\\d+\\.\\d+(?:\\.\\d+)?)`);
+  const m  = gemfile.match(re);
+  if (!m) return null;
+  return { op: m[1].trim(), parts: m[2].split('.').map(Number) };
+}
+
+// Returns true if versionStr satisfies constraint { op, parts }.
+function versionSatisfies(versionStr, { op, parts: c }) {
+  const v = versionStr.split('.').map(Number);
+  if (op === '~>') {
+    // ~> X.Y  → >= X.Y.0 AND < (X+1).0   (2-part: pessimistic on minor)
+    // ~> X.Y.Z → >= X.Y.Z AND < X.(Y+1).0  (3-part: pessimistic on patch)
+    if (c.length === 2) return v[0] === c[0] && (v[1] > c[1] || (v[1] === c[1]));
+    if (c.length === 3) return v[0] === c[0] && v[1] === c[1] && (v[2] ?? 0) >= c[2];
+  }
+  if (op === '>=') {
+    for (let i = 0; i < Math.max(v.length, c.length); i++) {
+      const d = (v[i] ?? 0) - (c[i] ?? 0);
+      if (d !== 0) return d > 0;
+    }
+    return true;
+  }
+  return false;
+}
+
+function compareVersions(a, b) {
+  const av = a.split('.').map(Number);
+  const bv = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(av.length, bv.length); i++) {
+    const d = (av[i] ?? 0) - (bv[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
 // ── "Ships with" lookup ───────────────────────────────────────────────────────
 
-// Returns the label of the newest Logstash version that would install gems from
-// this plugin branch, given the sorted (newest-first) logstashRefs list.
-function getLatestLogstash(repo, branch, logstashRefs) {
-  const isXBranch   = /^\d+\.x/.test(branch);
-  const majorMatch  = branch.match(/^(\d+)/);
-  const minorMatch  = branch.match(/^\d+\.(\d+)/);
-  const branchMajor = majorMatch ? parseInt(majorMatch[1], 10) : Infinity;
-  const branchMinor = isXBranch  ? Infinity : (minorMatch ? parseInt(minorMatch[1], 10) : 0);
+// For each Logstash ref, bundler installs the highest gem version satisfying the
+// constraint. A branch "ships with" a Logstash version only if its version is
+// that highest match (i.e. bundler would actually resolve to it).
+// branchVersions: { branchName -> versionStr | null }
+function getLatestLogstash(repo, branch, branchVersions, logstashRefs) {
+  const thisVersion = branchVersions[branch];
+  if (!thisVersion) return '—';
 
-  for (const { label, gemfile } of logstashRefs) {
-    const floor = parseFloor(gemfile, repo);
-    if (!floor) continue; // plugin not referenced in this Logstash version
-    if (branch === 'main') return label; // main tracks latest → first match wins
-    const majorOk = branchMajor > floor.major ||
-                   (branchMajor === floor.major && branchMinor >= floor.minor);
-    if (majorOk) return label;
+  for (const { label, gemfile } of logstashRefs) {   // newest-first
+    const constraint = parseConstraintFull(gemfile, repo);
+    if (!constraint) continue;
+
+    const satisfying = Object.values(branchVersions)
+      .filter(v => v && versionSatisfies(v, constraint));
+    if (!satisfying.length) continue;
+
+    const highest = satisfying.sort(compareVersions).at(-1);
+    if (thisVersion === highest) return label;
   }
   return '—';
 }
@@ -243,7 +295,10 @@ function badgesHTML(repo, branch, workflows) {
   }).join('\n      ');
 }
 
-function rowHTML(plugin, branch, logstashVersion) {
+function rowHTML(plugin, branch, gemVersion, logstashVersion) {
+  const verCell = gemVersion
+    ? `<span class="gem-version">${gemVersion}</span>`
+    : `<span class="gem-version ls-unknown">—</span>`;
   const lsCell = logstashVersion === '—'
     ? `<span class="ls-version ls-unknown">—</span>`
     : `<span class="ls-version">${logstashVersion}</span>`;
@@ -255,6 +310,7 @@ function rowHTML(plugin, branch, logstashVersion) {
         </div>
       </td>
       <td><span class="branch-tag">${BRANCH_SVG}${branch}</span></td>
+      <td>${verCell}</td>
       <td>${lsCell}</td>
       <td><div class="badges">
         ${badgesHTML(plugin.repo, branch, plugin.workflows)}
@@ -265,9 +321,13 @@ function rowHTML(plugin, branch, logstashVersion) {
 function groupHTML(id, label, dotClass, rows, logstashRefs) {
   const bodyRows = rows.length
     ? rows.map(({ plugin, branch }) =>
-        rowHTML(plugin, branch, getLatestLogstash(plugin.repo, branch, logstashRefs))
+        rowHTML(
+          plugin, branch,
+          plugin.branchVersions?.[branch] ?? null,
+          getLatestLogstash(plugin.repo, branch, plugin.branchVersions ?? {}, logstashRefs),
+        )
       ).join('\n    ')
-    : `<tr class="empty-row"><td colspan="4">None</td></tr>`;
+    : `<tr class="empty-row"><td colspan="5">None</td></tr>`;
   return `<div class="group group-${dotClass}" id="group-${id}">
     <div class="group-header">
       <span class="group-label"><span class="dot"></span>${label}</span>
@@ -277,6 +337,7 @@ function groupHTML(id, label, dotClass, rows, logstashRefs) {
       <thead><tr>
         <th class="col-plugin">Plugin</th>
         <th class="col-branch">Branch</th>
+        <th class="col-version">Version</th>
         <th class="col-logstash">Latest Logstash</th>
         <th>Workflows</th>
       </tr></thead>
@@ -440,11 +501,12 @@ function renderHTML(passing, failing, noStatus, generatedAt, logstashRefs) {
 
     .empty-row td { padding: 14px 16px; color: var(--muted); font-style: italic; font-size: 13px; }
 
-    .col-plugin   { width: 300px; }
-    .col-branch   { width: 120px; }
+    .col-plugin   { width: 280px; }
+    .col-branch   { width: 110px; }
+    .col-version  { width: 100px; }
     .col-logstash { width: 130px; }
 
-    .ls-version {
+    .gem-version, .ls-version {
       font-size: 12px;
       font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
       background: var(--surface2);
@@ -453,7 +515,7 @@ function renderHTML(passing, failing, noStatus, generatedAt, logstashRefs) {
       border-radius: 4px;
       white-space: nowrap;
     }
-    .ls-version.ls-unknown { color: var(--muted); }
+    .ls-unknown { color: var(--muted); }
 
     footer {
       margin-top: 48px;
@@ -495,12 +557,16 @@ ${groupHTML('nostatus', 'No Status', 'nostatus', noStatus, logstashRefs)}
 
 const { logstashRefs, versionFloors } = await buildLogstashContext();
 
-// Resolve branches for all plugins in parallel, then flatten into pairs.
+// Resolve branches and gem versions for all plugins in parallel.
 const pluginsWithBranches = await Promise.all(
   PLUGINS.map(async p => {
     const branches = await fetchBranches(p.repo, versionFloors[p.repo] ?? { major: 0, minor: 0 });
-    console.log(`${p.repo} branches: ${branches.join(', ')}`);
-    return { ...p, branches };
+    const versionEntries = await Promise.all(
+      branches.map(async b => [b, await fetchGemVersion(p.repo, b)])
+    );
+    const branchVersions = Object.fromEntries(versionEntries);
+    console.log(`${p.repo} branches+versions:`, Object.entries(branchVersions).map(([b, v]) => `${b}@${v ?? '?'}`).join(', '));
+    return { ...p, branches, branchVersions };
   })
 );
 
