@@ -59,11 +59,34 @@ const HEADERS = {
 
 // ── Version floor detection ───────────────────────────────────────────────────
 
-// Fetch Gemfile.template from a logstash branch (the only form that exists).
+// Fetch Gemfile.template from a logstash branch.
 async function fetchLogstashGemfile(branch) {
   const url = `https://raw.githubusercontent.com/elastic/logstash/${branch}/Gemfile.template`;
   const res = await fetch(url, { headers: HEADERS });
   return res.ok ? res.text() : null;
+}
+
+// Find and fetch the Gemfile.jruby-*.lock.release file from a logstash branch.
+// This is the definitive list of pinned gem versions that actually ship.
+async function fetchLogstashLockfile(branch) {
+  const contentsRes = await fetch(
+    `https://api.github.com/repos/elastic/logstash/contents/?ref=${branch}`,
+    { headers: HEADERS }
+  );
+  if (!contentsRes.ok) return null;
+  const files = await contentsRes.json();
+  const lockfileEntry = files.find(f => /^Gemfile\.jruby-[\d.]+\.lock\.release$/.test(f.name));
+  if (!lockfileEntry) return null;
+  const lockRes = await fetch(lockfileEntry.download_url, { headers: HEADERS });
+  return lockRes.ok ? lockRes.text() : null;
+}
+
+// Parse the pinned version for a gem from a lockfile.
+// The lockfile format is:  `    logstash-foo (1.2.3-java)`
+function parseLockfileVersion(lockfile, gemName) {
+  if (!lockfile) return null;
+  const m = lockfile.match(new RegExp(`^    ${gemName} \\(([^)]+)\\)`, 'm'));
+  return m ? m[1].replace(/-java$/, '') : null;
 }
 
 // Parse { major, minor } floor from a Gemfile.template for a given gem.
@@ -98,28 +121,43 @@ async function latestLogstash9xBranch() {
 
 // Builds Logstash context used for both branch filtering and the "ships with" column.
 // Returns:
-//   logstashRefs  — [{ label, gemfile }, ...] sorted newest-first
+//   logstashRefs  — [{ label, gemfile, lockfile }, ...] sorted newest-first
 //   versionFloors — { repo -> { major, minor } }
 async function buildLogstashContext() {
   const [gemfile8, branch9] = await Promise.all([
     fetchLogstashGemfile('8.19'),
     latestLogstash9xBranch(),
   ]);
-  const gemfile9 = branch9 ? await fetchLogstashGemfile(branch9) : null;
+  const [gemfile9, lock8, lock9] = await Promise.all([
+    branch9 ? fetchLogstashGemfile(branch9)   : Promise.resolve(null),
+    fetchLogstashLockfile('8.19'),
+    branch9 ? fetchLogstashLockfile(branch9)  : Promise.resolve(null),
+  ]);
   console.log(`Logstash 9.x reference branch: ${branch9 ?? 'none'}`);
 
-  // Newest-first so getLatestLogstash() can short-circuit on first match.
+  // Newest-first. Lockfile is the definitive version source; gemfile used for floor detection.
   const logstashRefs = [
-    ...(branch9 && gemfile9 ? [{ label: branch9, gemfile: gemfile9 }] : []),
-    ...(gemfile8             ? [{ label: '8.19',  gemfile: gemfile8  }] : []),
+    ...(branch9 ? [{ label: branch9, gemfile: gemfile9, lockfile: lock9 }] : []),
+    { label: '8.19', gemfile: gemfile8, lockfile: lock8 },
   ];
+
+  // Log what the lockfiles actually pin for each plugin
+  for (const p of PLUGINS) {
+    const v9 = parseLockfileVersion(lock9, p.repo);
+    const v8 = parseLockfileVersion(lock8, p.repo);
+    console.log(`${p.repo} lockfile pins: 8.19→${v8 ?? 'n/a'}, ${branch9}→${v9 ?? 'n/a'}`);
+  }
 
   const versionFloors = Object.fromEntries(
     PLUGINS.map(p => {
-      const f8 = parseFloor(gemfile8, p.repo);
-      const f9 = parseFloor(gemfile9, p.repo);
+      // Prefer Gemfile.template constraints for the floor; fall back to the lockfile
+      // version's major.minor for plugins absent from the template (e.g. grok/kafka in 9.x).
+      const f8 = parseFloor(gemfile8, p.repo)
+              ?? (() => { const v = parseLockfileVersion(lock8, p.repo); return v ? { major: parseInt(v), minor: parseInt(v.split('.')[1]) } : null; })();
+      const f9 = parseFloor(gemfile9, p.repo)
+              ?? (() => { const v = parseLockfileVersion(lock9, p.repo); return v ? { major: parseInt(v), minor: parseInt(v.split('.')[1]) } : null; })();
       const floor = minFloor(f8, f9) ?? { major: 0, minor: 0 };
-      console.log(`${p.repo} floor: ${floor.major}.${floor.minor} (8.19→${f8 ? `${f8.major}.${f8.minor}` : 'n/a'}, ${branch9}→${f9 ? `${f9.major}.${f9.minor}` : 'n/a'})`);
+      console.log(`${p.repo} floor: ${floor.major}.${floor.minor}`);
       return [p.repo, floor];
     })
   );
@@ -230,26 +268,19 @@ function compareVersions(a, b) {
 
 // ── "Ships with" lookup ───────────────────────────────────────────────────────
 
-// For each Logstash ref, bundler installs the highest gem version satisfying the
-// constraint. A branch "ships with" a Logstash version only if its version is
-// that highest match (i.e. bundler would actually resolve to it).
-// branchVersions: { branchName -> versionStr | null }
-function getLatestLogstash(repo, branch, branchVersions, logstashRefs) {
+// Returns all Logstash version labels whose lockfile pins exactly the version
+// on this plugin branch — i.e. the definitive "ships with" list.
+// logstashRefs is sorted newest-first; we return oldest-first for display.
+function getShipsWithLogstash(repo, branch, branchVersions, logstashRefs) {
   const thisVersion = branchVersions[branch];
   if (!thisVersion) return '—';
 
-  for (const { label, gemfile } of logstashRefs) {   // newest-first
-    const constraint = parseConstraintFull(gemfile, repo);
-    if (!constraint) continue;
+  const matches = logstashRefs
+    .filter(({ lockfile }) => parseLockfileVersion(lockfile, repo) === thisVersion)
+    .map(({ label }) => label);
 
-    const satisfying = Object.values(branchVersions)
-      .filter(v => v && versionSatisfies(v, constraint));
-    if (!satisfying.length) continue;
-
-    const highest = satisfying.sort(compareVersions).at(-1);
-    if (thisVersion === highest) return label;
-  }
-  return '—';
+  if (!matches.length) return '—';
+  return matches.reverse().join(', '); // oldest-first (e.g. "8.19, 9.3")
 }
 
 async function fetchConclusion(repo, workflowFile, branch) {
@@ -324,7 +355,7 @@ function groupHTML(id, label, dotClass, rows, logstashRefs) {
         rowHTML(
           plugin, branch,
           plugin.branchVersions?.[branch] ?? null,
-          getLatestLogstash(plugin.repo, branch, plugin.branchVersions ?? {}, logstashRefs),
+          getShipsWithLogstash(plugin.repo, branch, plugin.branchVersions ?? {}, logstashRefs),
         )
       ).join('\n    ')
     : `<tr class="empty-row"><td colspan="5">None</td></tr>`;
@@ -338,7 +369,7 @@ function groupHTML(id, label, dotClass, rows, logstashRefs) {
         <th class="col-plugin">Plugin</th>
         <th class="col-branch">Branch</th>
         <th class="col-version">Version</th>
-        <th class="col-logstash">Latest Logstash</th>
+        <th class="col-logstash">Ships with Logstash</th>
         <th>Workflows</th>
       </tr></thead>
       <tbody>
